@@ -36,6 +36,7 @@ interface Window {
     coachState(on: boolean): void;
     onCoach(fn: (what: string) => void): void;
     perch?(on: boolean): void;
+    perchAble?(): Promise<boolean | "wayland">;
     onPerch?(fn: (w: { id: string; x: number; y: number; width: number; height: number } | null) => void): void;
     platform?: string;
   };

@@ -1,9 +1,12 @@
 // The native side: a small transparent window that only catches the mouse over the character, a tray menu and a settings
 // window. Everything else lives in the pages (src/); they reach this file only through preload.ts.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
-import { join, normalize, sep } from "node:path";
+import { homedir, hostname } from "node:os";
+import { basename, join, normalize, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import { connect as xConnect } from "node:net";
 import { setLang, t, type Lang } from "../src/i18n.ts";
 import { BrowserWindow, Menu, Notification, Tray, app, desktopCapturer, dialog, globalShortcut, ipcMain, nativeImage, net, powerMonitor, protocol, screen, shell } from "electron";
 
@@ -230,6 +233,10 @@ function handleCalls() {
   ipcMain.on("panel-close", () => { panel?.close(); pet.webContents.send("open", ""); });   // picked: the chat opens on the fly
   ipcMain.on("quit", () => app.quit());
   ipcMain.on("perch", (_e, on: boolean) => perchWatch(!!on));
+  // whether the settings row can turn it on at all: true where the watcher works, "wayland" for the row's note, false to
+  // hide the row (anything else)
+  ipcMain.handle("perch-able", () =>
+    process.platform === "win32" || process.platform === "darwin" ? true : process.platform === "linux" ? perchLinuxAble() : false);
   // ---- the game coach (flytrade/COACH-PLAN.md): the pet only looks; it never sends input to a game ----------------
   // the open windows to pick the game from, with small thumbnails: only while the picker is open, never in a loop
   ipcMain.handle("coach-sources", async () => {
@@ -329,9 +336,92 @@ else {
 }
 
 // ---- sitting on your windows (2026-11-18, flypet/EXPEDITIONS-PLAN.md; the user: "Also window perching") -------------------
-// Windows only: one small PowerShell loop reads the window in front (its box, process and class) every 0.7 s while the
-// setting is on, and the pet hears its box in screen DIPs - or null for the desktop, the taskbar, our own windows, a
-// minimized or maximized window. It only reads where a window is: never its contents, never any input.
+// Windows, macOS and Linux X11 (2026-11-19, issue #56); Wayland has no window list to read and stays off (the settings row
+// says so). While the setting is on, the window in front is read every 0.7 s and the pet hears its box in screen DIPs - or
+// null for the desktop, our own windows, or a window with no room above it. A window manager without EWMH's
+// _NET_ACTIVE_WINDOW (rare on X11) means no perching, not a wrong one. It only reads where a window is and an id for it:
+// never its title, never its contents, never any input.
+// Windows: a small PowerShell loop, GetForegroundWindow's box, process and class. macOS: the same loop in osascript's
+// JavaScript, taking the first normal-level on-screen window from CGWindowListCopyWindowInfo - no permission prompt,
+// because window names are never asked for. Linux: the X wire itself, spoken over one socket to the server that is
+// already running (nothing to install): the root's _NET_ACTIVE_WINDOW, that window's _NET_WM_PID and its box.
+const PERCH_MS = 700;
+type PerchBox = { x: number; y: number; width: number; height: number };
+type PerchWin = PerchBox & { id: string };
+let perchProc: ChildProcess | null = null, perchLast = "";
+function perchSend(msg: PerchWin | null) {
+  const key = JSON.stringify(msg);
+  if (key !== perchLast && pet && !pet.isDestroyed()) { perchLast = key; pet.webContents.send("perch", msg); }
+}
+function ownWindow(b: PerchBox): boolean {
+  // the helpers can't see the pet's own pid the way Windows does (macOS windows belong to its helper processes, Linux
+  // ones may not say), so ours are told by their box, which this process knows exactly
+  return BrowserWindow.getAllWindows().some((w) => {
+    if (!w.isVisible()) return false;
+    const g = w.getBounds();
+    return g.width === b.width && g.height === b.height && Math.abs(g.x - b.x) <= 2 && Math.abs(g.y - b.y) <= 2;
+  });
+}
+const perchOk = (b: PerchBox) => b.width >= 240 && b.height >= 120 && [b.x, b.y, b.width, b.height].every((n) => Number.isFinite(n));
+/** a box in screen pixels as DIPs for Linux, where Electron only offers the point conversions (the rect one is Windows
+ * only, which is what the Windows watcher above uses); a box is just its two corners */
+function dipRect(box: PerchBox): PerchBox {
+  const a = screen.screenToDipPoint({ x: box.x, y: box.y }), b = screen.screenToDipPoint({ x: box.x + box.width, y: box.y + box.height });
+  return { x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y };
+}
+
+/** Linux: on a Wayland session (or without any DISPLAY) there is no front window to read - the row explains, the watcher stays off */
+function perchLinuxAble(): boolean | "wayland" {
+  const way = process.env.XDG_SESSION_TYPE === "wayland" || (!!process.env.WAYLAND_DISPLAY && process.env.XDG_SESSION_TYPE !== "x11");
+  return way || !process.env.DISPLAY ? "wayland" : true;
+}
+function perchWatch(on: boolean) {
+  if (process.platform === "linux" && perchLinuxAble() !== true) on = false;
+  if (!on) {
+    perchProc?.kill(); perchProc = null; perchLast = "";
+    x11Stop();
+    return;
+  }
+  if (perchProc || x11) return;
+  if (process.platform === "win32") {
+    const ps = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", PERCH_PS], { windowsHide: true });
+    perchProc = ps;
+    let buf = "";
+    ps.stdout?.setEncoding("utf8");
+    ps.stdout?.on("data", (chunk: string) => {
+      buf += chunk;
+      let i: number;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        const [hwnd, pid, l, t_, r, b, zoomed, iconic, cls] = line.split("|");
+        const box = { x: Number(l), y: Number(t_), width: Number(r) - Number(l), height: Number(b) - Number(t_) };
+        const skip = !hwnd || Number(pid) === process.pid || zoomed === "1" || iconic === "1" || PERCH_SKIP.has(cls ?? "")
+          || !perchOk(box);
+        const dip = skip ? null : screen.screenToDipRect(null, box);
+        perchSend(dip ? { id: hwnd, ...dip } : null);
+      }
+    });
+    ps.on("exit", () => { if (perchProc === ps) perchProc = null; });
+  } else if (process.platform === "darwin") {
+    // its lines (on stderr, where osascript's console goes) are the front normal window's number and box in points, which
+    // on macOS are the screen DIPs already; ours and the desktop are filtered here, where the boxes are known
+    const ps = spawn("osascript", ["-l", "JavaScript", "-e", PERCH_JXA]);
+    perchProc = ps;
+    let buf = "";
+    ps.stderr?.setEncoding("utf8");
+    ps.stderr?.on("data", (chunk: string) => {
+      buf += chunk;
+      let i: number;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        const [num, x, y, w, h] = line.split("|");
+        const box = num ? { id: num, x: Number(x), y: Number(y), width: Number(w), height: Number(h) } : null;
+        perchSend(box && perchOk(box) && !ownWindow(box) ? box : null);
+      }
+    });
+    ps.on("exit", () => { if (perchProc === ps) perchProc = null; });
+  } else void x11Start();
+}
 const PERCH_PS = `
 Add-Type @"
 using System; using System.Text; using System.Runtime.InteropServices;
@@ -352,31 +442,186 @@ while ($true) {
   Start-Sleep -Milliseconds 700
 }`;
 const PERCH_SKIP = new Set(["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow", "Windows.UI.Core.CoreWindow"]);
-let perchProc: ChildProcess | null = null, perchLast = "";
-function perchWatch(on: boolean) {
-  if (!on || process.platform !== "win32") {
-    perchProc?.kill(); perchProc = null; perchLast = "";
+// the front window (not the desktop, the dock, the menu bar, the pet or anything else of ours): the first normal-level
+// on-screen window in front-to-back order, with only its number and its box taken - our own windows are told by the
+// running app's name (Electron in a dev run, Fly Pet in the packaged one), so the detached dev tools are caught too
+const PERCH_JXA = `
+ObjC.import('Foundation'); ObjC.import('CoreGraphics')
+const MINE = ${JSON.stringify([...new Set([basename(process.execPath).replace(/\.app$/, ""), app.getName()])])}
+function front() {
+  const list = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(20, 0), 'NSArray')   // 4 on-screen only | 16 without the desktop
+  for (let i = 0; list && i < list.count; i++) {
+    const w = list.objectAtIndex(i)
+    if (w.objectForKey('kCGWindowLayer').intValue !== 0) continue                     // layer 0 = a normal window
+    if (MINE.indexOf(String(w.objectForKey('kCGWindowOwnerName'))) >= 0) continue
+    const b = w.objectForKey('kCGWindowBounds')
+    if (!b) continue
+    console.log(w.objectForKey('kCGWindowNumber').longLongValue + '|' +
+      b.objectForKey('X').doubleValue + '|' + b.objectForKey('Y').doubleValue +
+      '|' + b.objectForKey('Width').doubleValue + '|' + b.objectForKey('Height').doubleValue)
+    return
+  }
+  console.log('')
+}
+while (true) { front(); $.NSThread.sleepForTimeInterval(0.7) }`;
+
+// ---- linux: the X wire, spoken straight to the server that is already running (nothing to install) -----------------------
+// One connection, made when the setting comes on and closed when it goes off. Every 0.7 s it asks exactly three things:
+// the root's _NET_ACTIVE_WINDOW (the window in front), that window's _NET_WM_PID (to skip our own), and its box. The wire
+// is little-endian (the first byte below asks for that); a reply is 32 bytes plus its length in 4-byte units, an error or
+// an event is 32, and each carries the sequence number of its request, so one reply at a time is waited for by number.
+type X11 = { sock: import("node:net").Socket; root: number; seq: number; buf: Buffer; pending: { seq: number; r: (msg: Buffer | null) => void } | null; setup: boolean; waiters: { n: number; r: (b: Buffer) => void }[] };
+let x11: X11 | null = null, x11Atoms: { active: number; pid: number } | null = null, x11Timer: NodeJS.Timeout | null = null, x11Busy = false;
+const pad4 = (n: number) => (4 - (n % 4)) % 4;
+
+/** ~/.Xauthority's cookie for this display (or XAUTHORITY's), to open the connection: read once, never stored or sent anywhere else */
+function x11Auth(display: number): { name: string; data: Buffer } | null {
+  let b: Buffer;
+  try { b = readFileSync(process.env.XAUTHORITY || join(homedir(), ".Xauthority")); } catch { return null; }
+  const host = hostname();
+  let best: { name: string; data: Buffer; rank: number } | null = null;
+  for (let i = 0; i + 4 <= b.length;) {
+    const family = b.readUInt16BE(i);
+    const aLen = b.readUInt16BE(i + 2); i += 4;
+    if (i + aLen + 2 > b.length) break;
+    const addr = b.subarray(i, i + aLen); i += aLen;
+    const nLen = b.readUInt16BE(i); i += 2;
+    if (i + nLen > b.length) break;
+    const num = b.toString("latin1", i, i + nLen); i += nLen;
+    const naLen = b.readUInt16BE(i); i += 2;
+    if (i + naLen > b.length) break;
+    const name = b.toString("latin1", i, i + naLen); i += naLen;
+    const dLen = b.readUInt16BE(i); i += 2;
+    if (i + dLen > b.length) break;
+    const data = b.subarray(i, i + dLen); i += dLen;
+    if (num !== "" && num !== String(display)) continue;
+    const rank = family === 256 && addr.toString("latin1") === host ? 3 : family === 0 || family === 6 ? 2 : family === 254 ? 1 : 0;
+    if (rank && (!best || rank > best.rank)) best = { name, data, rank };
+  }
+  return best;
+}
+// every byte lands in x.buf: during the handshake exact lengths are drawn from its front, afterwards whole replies
+function x11Feed(x: X11, chunk: Buffer) {
+  x.buf = x.buf.length ? Buffer.concat([x.buf, chunk]) : chunk;
+  if (x.setup) {
+    while (x.waiters.length && x.buf.length >= x.waiters[0].n) {
+      const w = x.waiters.shift()!; w.r(x.buf.subarray(0, w.n)); x.buf = x.buf.subarray(w.n);
+    }
     return;
   }
-  if (perchProc) return;
-  const ps = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", PERCH_PS], { windowsHide: true });
-  perchProc = ps;
-  let buf = "";
-  ps.stdout?.setEncoding("utf8");
-  ps.stdout?.on("data", (chunk: string) => {
-    buf += chunk;
-    let i: number;
-    while ((i = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-      const [hwnd, pid, l, t_, r, b, zoomed, iconic, cls] = line.split("|");
-      const box = { x: Number(l), y: Number(t_), width: Number(r) - Number(l), height: Number(b) - Number(t_) };
-      const skip = !hwnd || Number(pid) === process.pid || zoomed === "1" || iconic === "1" || PERCH_SKIP.has(cls ?? "")
-        || !(box.width >= 240 && box.height >= 120) || [box.x, box.y, box.width, box.height].some((n) => !Number.isFinite(n));
-      const dip = skip ? null : screen.screenToDipRect(null, box);
-      const msg = dip ? { id: hwnd, x: dip.x, y: dip.y, width: dip.width, height: dip.height } : null;
-      const key = JSON.stringify(msg);
-      if (key !== perchLast && pet && !pet.isDestroyed()) { perchLast = key; pet.webContents.send("perch", msg); }
+  while (x.buf.length >= 32) {
+    const total = x.buf[0] === 1 ? 32 + x.buf.readUInt32LE(4) * 4 : 32;
+    if (x.buf.length < total) return;
+    const msg = x.buf.subarray(0, total); x.buf = x.buf.subarray(total);
+    if (x.pending && (msg[0] === 1 || msg[0] === 0) && msg.readUInt16LE(2) === x.pending.seq) {
+      const p = x.pending; x.pending = null; p.r(msg[0] === 1 ? msg : null);
     }
+  }
+}
+const x11Bytes = (x: X11, n: number) => new Promise<Buffer>((r) => { if (x.buf.length >= n) { r(x.buf.subarray(0, n)); x.buf = x.buf.subarray(n); } else x.waiters.push({ n, r }); });
+function x11Request(x: X11, req: Buffer): Promise<Buffer | null> {
+  return new Promise((r) => {
+    if (x.sock.destroyed) return r(null);
+    const seq = (x.seq = (x.seq + 1) & 0xffff);
+    x.pending = { seq, r };
+    x.sock.write(req);
   });
-  ps.on("exit", () => { if (perchProc === ps) perchProc = null; });
+}
+async function x11Intern(x: X11, name: string): Promise<number | null> {
+  const bytes = Buffer.from(name, "latin1");
+  const req = Buffer.alloc(8 + Math.ceil(bytes.length / 4) * 4);
+  req[0] = 16; req[1] = 1;                            // InternAtom, only if it exists (it does, on any EWMH window manager)
+  req.writeUInt16LE(2 + Math.ceil(bytes.length / 4), 2);
+  req.writeUInt16LE(bytes.length, 4);
+  bytes.copy(req, 8);
+  const r = await x11Request(x, req);
+  return r ? r.readUInt32LE(8) : null;
+}
+async function x11Cardinal(x: X11, win: number, prop: number): Promise<number | null> {
+  if (!win || !prop) return null;
+  const req = Buffer.alloc(24);
+  req[0] = 20; req.writeUInt16LE(6, 2);               // GetProperty: the reply's format is its second byte, the value at 32
+  req.writeUInt32LE(win, 4); req.writeUInt32LE(prop, 8); req.writeUInt32LE(0, 12);
+  req.writeUInt32LE(0, 16); req.writeUInt32LE(1, 20);
+  const r = await x11Request(x, req);
+  return r && r[1] === 32 ? r.readUInt32LE(32) : null;
+}
+async function x11Geometry(x: X11, win: number): Promise<{ w: number; h: number } | null> {
+  const req = Buffer.alloc(8);
+  req[0] = 14; req.writeUInt16LE(2, 2);               // GetGeometry: root at 8, the box at 12 (relative to its frame)
+  req.writeUInt32LE(win, 4);
+  const r = await x11Request(x, req);
+  return r ? { w: r.readUInt16LE(16), h: r.readUInt16LE(18) } : null;
+}
+async function x11Origin(x: X11, win: number, root: number): Promise<{ x: number; y: number } | null> {
+  const req = Buffer.alloc(16);
+  req[0] = 40; req.writeUInt16LE(4, 2);               // TranslateCoordinates: the frame's child at 8, the origin at 12
+  req.writeUInt32LE(win, 4); req.writeUInt32LE(root, 8);
+  const r = await x11Request(x, req);
+  return r ? { x: r.readInt16LE(12), y: r.readInt16LE(14) } : null;
+}
+let x11Gen = 0;
+function x11Stop() {
+  x11Gen++;                                        // a connect still in flight when the setting went off is discarded
+  if (x11Timer) { clearInterval(x11Timer); x11Timer = null; }
+  if (x11) { const x = x11; x11 = null; x.pending?.r(null); x.pending = null; x.sock.destroy(); }
+  x11Atoms = null; x11Busy = false;
+}
+async function x11Connect(): Promise<X11> {
+  const d = /^([^:]*):(\d+)/.exec(process.env.DISPLAY ?? "");
+  if (!d) throw new Error("no DISPLAY");
+  const n = Number(d[2]);
+  const x: X11 = { sock: null as unknown as X11["sock"], root: 0, seq: 0, buf: Buffer.alloc(0), pending: null, setup: true, waiters: [] };
+  x.sock = xConnect(!d[1] || d[1] === "unix" ? { path: `/tmp/.X11-unix/X${n}` } : { host: d[1], port: 6000 + n });
+  x.sock.on("data", (c: Buffer) => x11Feed(x, c));
+  x.sock.on("error", () => x11Stop());
+  await new Promise<void>((res, rej) => { x.sock.once("connect", res); x.sock.once("error", rej); });
+  const auth = x11Auth(n) ?? { name: "", data: Buffer.alloc(0) };
+  const hs = Buffer.alloc(12 + Math.ceil(auth.name.length / 4) * 4 + Math.ceil(auth.data.length / 4) * 4);
+  hs[0] = 0x6c;                                      // 'l': the whole wire little-endian
+  hs.writeUInt16LE(11, 2); hs.writeUInt16LE(0, 4);
+  hs.writeUInt16LE(auth.name.length, 6); hs.writeUInt16LE(auth.data.length, 8);
+  Buffer.from(auth.name, "latin1").copy(hs, 12);
+  auth.data.copy(hs, 12 + Math.ceil(auth.name.length / 4) * 4);
+  x.sock.write(hs);
+  const head = await x11Bytes(x, 8);                 // [ok][pad][major@2][minor@4][length@6, in 4-byte units]
+  if (head[0] !== 1) throw new Error("the X server refused the connection");
+  const setup = Buffer.concat([head, await x11Bytes(x, head.readUInt16LE(6) * 4)]);
+  // then: release, id base/mask, motion buffer, vendor length, max request, screen and format counts, byte orders,
+  // scanline unit/pad, keycodes; the vendor string, the 8-byte formats, and the screens, whose first 4 bytes are the root
+  const nScreens = setup[28], nFormats = setup[29], vendorLen = setup.readUInt16LE(24);
+  x.root = setup.readUInt32LE(40 + vendorLen + pad4(vendorLen) + 8 * nFormats);
+  if (!nScreens || !x.root) throw new Error("no screen on the X server");
+  x.setup = false;
+  return x;
+}
+async function x11Tick() {
+  const x = x11;
+  if (!x || x11Busy) return;
+  x11Busy = true;
+  try {
+    if (!x11Atoms) x11Atoms = { active: (await x11Intern(x, "_NET_ACTIVE_WINDOW")) ?? 0, pid: (await x11Intern(x, "_NET_WM_PID")) ?? 0 };
+    const win = await x11Cardinal(x, x.root, x11Atoms.active);      // 0 = none; 1 is a placeholder some compositors use
+    let msg: PerchWin | null = null;
+    if (win && win !== 1) {
+      const pid = await x11Cardinal(x, win, x11Atoms.pid);          // Chromium sets it: our own windows are skipped here
+      const geo = await x11Geometry(x, win), org = await x11Origin(x, win, x.root);
+      if (geo && org) {
+        const dip = dipRect({ x: org.x, y: org.y, width: geo.w, height: geo.h });
+        const box = { id: `0x${win.toString(16)}`, ...dip };
+        if (pid !== process.pid && perchOk(box) && !ownWindow(box)) msg = box;
+      }
+    }
+    perchSend(msg);
+  } catch { x11Stop(); }                             // the socket went away: off until the next time the setting is on
+  finally { x11Busy = false; }
+}
+async function x11Start() {
+  const gen = ++x11Gen;
+  try {
+    const x = await x11Connect();
+    if (gen !== x11Gen) { x.sock.destroy(); return; }
+    x11 = x;
+    x11Timer = setInterval(() => void x11Tick(), PERCH_MS);
+  } catch { if (gen === x11Gen) x11 = null; }        // no X server to talk to right now: no perching
 }

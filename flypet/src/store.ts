@@ -26,7 +26,7 @@ export interface Prefs {
   coachSource: CoachSource | null;   // the game window the coach looks at (picked in the pet's window)
   coachNote: string;           // what the player told the coach about their run (optional)
   coachShare: boolean;         // "Help train the coach": share what the coach reads (never frames) - off until switched on
-  perch: boolean;              // sit on the window in front now and then (Windows; 2026-11-18)
+  perch: boolean;              // sit on the window in front now and then (Windows, macOS, X11 Linux; 2026-11-18, #56)
 }
 export interface CoachSource { id: string; name: string; process: string | null }
 const DEFAULTS = (): Prefs => ({ name: "Fly", born: Date.now(), wallet: null, flies: null, bubbles: true, notifications: true, minUsd: 0, quiet: false, homeX: null, lang: null, mineOn: false, mineAnyTime: false, minerToken: null, petToken: null, petTokenUntil: 0, fly: null, coachSource: null, coachNote: "", coachShare: false, perch: true });

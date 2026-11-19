@@ -35,8 +35,13 @@ function fillBasics() {
   minUsd.value = String(p.minUsd);
   bubbles.checked = p.bubbles;
   perch.checked = p.perch !== false;
-  $("perchRow").hidden = !!window.flyNative && window.flyNative.platform !== "win32";   // the watcher is Windows only
-  $("perchRow").title = t("set.perchHelp");
+  // the watcher runs on Windows, macOS and X11 Linux: the row says so; on Wayland (or anything else without a window
+  // list to read) it stays, turned off with the note; elsewhere it is hidden as before
+  void (native?.perchAble?.() ?? Promise.resolve<boolean | "wayland">(true)).then((able) => {
+    $("perchRow").hidden = able === false;
+    perch.disabled = able === "wayland";
+    $("perchRow").title = able === "wayland" ? `${t("set.perchHelp")} ${t("set.perchWayland")}` : t("set.perchHelp");
+  });
   notifications.checked = p.notifications;
 }
 nameBox.addEventListener("input", () => {
